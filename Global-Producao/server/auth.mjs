@@ -1,0 +1,15 @@
+import {scrypt,randomBytes,createHash,timingSafeEqual,randomUUID} from 'node:crypto';import {promisify} from 'node:util';
+import {db,read,save,transaction} from './store.mjs';
+const derive=promisify(scrypt);const params={N:131072,r:8,p:1,maxmem:160*1024*1024};
+export const digest=x=>createHash('sha256').update(x).digest('hex');
+export function normalizeLogin(x){const login=String(x||'').trim().toLowerCase();if(!/^[a-z0-9._-]{3,40}$/.test(login))throw new Error('Login: use 3 a 40 letras sem acentos, números, ponto, hífen ou sublinhado.');return login}
+export async function hashPassword(password){if(typeof password!=='string'||password.length<10||password.length>128)throw new Error('A senha deve ter entre 10 e 128 caracteres.');const salt=randomBytes(16);const hash=await derive(password,salt,32,params);return 'scrypt$'+salt.toString('hex')+'$'+hash.toString('hex')}
+const dummy='scrypt$'+'00'.repeat(16)+'$'+'00'.repeat(32);
+export async function verify(password,stored=dummy){if(typeof password!=='string'||password.length>128)return false;const [,salt,expected]=stored.split('$');const hash=await derive(password,Buffer.from(salt,'hex'),32,params);return timingSafeEqual(hash,Buffer.from(expected,'hex'))}
+export function tokenFrom(req){return (req.headers.cookie||'').split(';').map(s=>s.trim()).find(s=>s.startsWith('global_session='))?.slice(15)||''}
+export function current(req){const token=tokenFrom(req);if(!token)return null;const session=db.prepare('SELECT user_id FROM sessions WHERE token_hash=? AND expires>?').get(digest(token),Date.now());if(!session)return null;const {state}=read();return state.users.find(u=>u.id===session.user_id&&u.active!==false)||null}
+export function session(userId){const token=randomBytes(32).toString('base64url');db.prepare('DELETE FROM sessions WHERE expires<?').run(Date.now());db.prepare('INSERT INTO sessions VALUES (?,?,?)').run(digest(token),userId,Date.now()+8*3600000);return token}
+export function revoke(userId){db.prepare('DELETE FROM sessions WHERE user_id=?').run(userId)}
+export function cookie(token){return `global_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${token?28800:0}${process.env.NODE_ENV==='production'?'; Secure':''}`}
+export function limit(key){const now=Date.now();db.prepare('DELETE FROM attempts WHERE until_time<?').run(now);const a=db.prepare('SELECT * FROM attempts WHERE key=?').get(key);if(a&&a.count>=8){const e=new Error('Muitas tentativas. Aguarde 15 minutos.');e.status=429;throw e}db.prepare('INSERT INTO attempts VALUES (?,1,?) ON CONFLICT(key) DO UPDATE SET count=count+1').run(key,now+15*60000)}
+export async function createAdmin(name,login,password){login=normalizeLogin(login);const hash=await hashPassword(password);transaction(()=>{const {state,revision}=read();if(state.users.length)throw new Error('Administrador inicial já existe. Use a interface para novos usuários.');const id=randomUUID();state.users.push({id,name,login,roles:['admin'],active:true,sectors:[]});db.prepare('INSERT INTO credentials VALUES (?,?,?)').run(id,login,hash);save(state,revision)})}
